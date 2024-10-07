@@ -211,6 +211,7 @@ class FluxPipeline:
             else:
                 self.generate(**warmup_dict)
 
+
         # Compile the model and extras
         to_gpu_extras = [
             "vector_in",
