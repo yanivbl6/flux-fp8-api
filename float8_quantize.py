@@ -27,6 +27,57 @@ except ImportError:
     CublasLinear = type(None)
 
 
+
+def float16_to_float8_e4m3fn(x, p):
+    assert(x.dtype == torch.float16, "Input tensor must be float16")
+    # Convert the tensor to float16 if it's not already
+    ##x = x.to(torch.float16)
+    
+    # Get the bit representation of the float16 tensor
+    tensor_bits = x.view(torch.int16)
+    
+    # Define the masks for the exponent, mantissa, and sign
+    exponent_mask = 0x7C00  # 0111 1100 0000 0000 (5 bits for exponent in float16)
+    mantissa_mask = 0x03FF  # 0000 0011 1111 1111 (10 bits for mantissa in float16)
+    mantissa_add = 0x0400 # 0000 0100 0000 0000 (Add 1 to the top bit of the mantissa)
+    sign_mask = 0x8000  # 1000 0000 0000 0000 (1 bit for sign in float16)
+    
+    # Extract the exponent, mantissa, and sign bits
+    exponent_bits = (tensor_bits & exponent_mask) >> 10
+    mantissa_bits = tensor_bits & mantissa_mask
+    sign_bits = (tensor_bits & sign_mask) >> 8  # Shift sign bit to the correct position for float8
+    
+    # Quantize the exponent to 4 bits (float8_e4m3fn)
+
+    exponent_bits = exponent_bits - 15 + 7  # Adjust exponent bias from 15 (float16) to 7 (float8)
+
+    if exponent_bits < 0:        
+        print("underflow, exponent_bits = %d" % exponent_bits)
+        mantissa_bits = (mantissa_bits + mantissa_add) >> (1 - exponent_bits)
+        exponent_bits = 0
+    elif exponent_bits > 15:
+        print("overflow, exponent_bits = %d" % exponent_bits)
+        exponent_bits = 15
+        mantissa_bits = (mantissa_mask >> 8) << 8
+    
+    # Quantize the mantissa to 3 bits (float8_e4m3fn)
+    mantissa_bits = mantissa_bits >> 7  # Keep the top 3 bits of the mantissa
+
+    # Combine the sign, exponent, and mantissa bits to form the float8_e4m3fn representation
+    float8_bits = sign_bits | (exponent_bits << 3) | mantissa_bits
+    
+    # Convert the remaining mantissa bits to integer tensors
+    remaining_mantissa_bits = tensor_bits & 0x007F  # Keep the remaining 7 bits of the mantissa
+    remaining_mantissa_bits = remaining_mantissa_bits >> (7 - p)
+    remaining_mantissa_bits = remaining_mantissa_bits.to(torch.uint8)  # Convert to uint8 for storage
+    float8_bits = float8_bits.to(torch.uint8)  # Convert to uint8 for storage
+    float8_bits = float8_bits.view(torch.float8_e4m3fn)
+    return float8_bits, remaining_mantissa_bits
+
+
+
+
+
 class F8Linear(nn.Module):
 
     def __init__(
@@ -41,6 +92,9 @@ class F8Linear(nn.Module):
         float_bias: torch.Tensor = None,
         num_scale_trials: int = 12,
         input_float8_dtype=torch.float8_e5m2,
+        activation_sr: bool = False,
+        weight_sr: int= 0,
+        new_range: bool = False,
     ) -> None:
         super().__init__()
         self.in_features = in_features
@@ -51,6 +105,19 @@ class F8Linear(nn.Module):
         self.weight_initialized = False
         self.max_value = torch.finfo(self.float8_dtype).max
         self.input_max_value = torch.finfo(self.input_float8_dtype).max
+
+        ## activation stochastic rounding
+        self.activation_sr = activation_sr
+        if self.activation_sr:
+            assert(dtype == torch.float16, "Activation stochastic rounding only supported for float16 pre-quant")
+            assert(self.input_float8_dtype == torch.float8_e4m3fn, "Activation stochastic rounding only supported for float8_e4m3fn post-quant")
+        self.weight_sr = weight_sr
+
+        if new_range:
+            self.max_fl = 2**(math.floor(math.log2(self.max_value)))
+        else:
+            self.max_fl = 1
+
         factory_kwargs = {"dtype": dtype, "device": device}
         if float_weight is None:
             self.weight = nn.Parameter(
@@ -192,14 +259,28 @@ class F8Linear(nn.Module):
                 "Weight tensor not found or has incorrect shape in state dict"
             )
 
+
     def quantize_weight(self):
         if self.weight_initialized:
             return
         amax = torch.max(torch.abs(self.weight.data)).float()
-        self.scale = self.amax_to_scale(amax, self.max_value)
-        self.float8_data = self.to_fp8_saturated(
-            self.weight.data, self.scale, self.max_value
-        ).to(self.float8_dtype)
+        self.scale = self.amax_to_scale(amax, self.max_value) / self.max_fl
+
+            ## need to maintain the +p mantissa bits
+        if self.weight_sr > 0:
+            assert(self.float8_dtype == torch.float8_e4m3fn, "Weight stochastic rounding only supported for float8_e4m3fn")
+            tmp = self.to_fp8_saturated(self.weight.data, self.scale, self.max_value)
+            self.float8_data, self.float8_residual = float16_to_float8_e4m3fn(tmp, self.weight_sr)
+            del tmp
+        else:    
+            self.float8_data = self.to_fp8_saturated(
+                self.weight.data, self.scale, self.max_value
+            ).to(self.float8_dtype)
+
+
+
+
+
         self.scale_reciprocal = self.scale.reciprocal()
         self.weight.data = torch.zeros(
             1, dtype=self.weight.dtype, device=self.weight.device, requires_grad=False
@@ -228,22 +309,36 @@ class F8Linear(nn.Module):
 
             self.input_amax_trials[self.trial_index] = amax
             self.trial_index += 1
+
+                
+
             self.input_scale = self.amax_to_scale(
                 self.input_amax_trials[: self.trial_index].max(), self.input_max_value
             )
             self.input_scale_reciprocal = self.input_scale.reciprocal()
-            return self.to_fp8_saturated(x, self.input_scale, self.input_max_value).to(
-                self.input_float8_dtype
-            )
+
+            if self.activation_sr:
+                tmp = self.to_fp8_saturated(x, self.input_scale, self.input_max_value)
+                tmp = tmp.view(torch.uint16) + torch.randint_like(tmp, 0, 2**(10-4)-1)
+                return tmp.to(self.input_float8_dtype)
+            else:
+                return self.to_fp8_saturated(x, self.input_scale, self.input_max_value).to(
+                    self.input_float8_dtype
+                )
         else:
             self.input_scale = self.amax_to_scale(
                 self.input_amax_trials.max(), self.input_max_value
             )
             self.input_scale_reciprocal = self.input_scale.reciprocal()
             self.input_scale_initialized = True
-            return self.to_fp8_saturated(x, self.input_scale, self.input_max_value).to(
-                self.input_float8_dtype
-            )
+            if self.activation_sr:
+                tmp = self.to_fp8_saturated(x, self.input_scale, self.input_max_value)
+                tmp = tmp.view(torch.uint16) + torch.randint_like(tmp, 0, 2**(10-4)-1)
+                return tmp.to(self.input_float8_dtype)
+            else:
+                return self.to_fp8_saturated(x, self.input_scale, self.input_max_value).to(
+                    self.input_float8_dtype
+                )
 
     def reset_parameters(self) -> None:
         if self.weight_initialized:
@@ -269,6 +364,12 @@ class F8Linear(nn.Module):
         self.max_value = torch.finfo(self.float8_dtype).max
         self.input_max_value = torch.finfo(self.input_float8_dtype).max
 
+        if new_range:
+            self.max_fl = 2**(math.floor(math.log2(self.max_value)))
+        else:
+            self.max_fl = 1
+
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.input_scale_initialized or is_compiling():
             x = self.to_fp8_saturated(x, self.input_scale, self.input_max_value).to(
@@ -281,9 +382,30 @@ class F8Linear(nn.Module):
         x = x.view(-1, self.in_features)
 
         # float8 matmul, much faster than float16 matmul w/ float32 accumulate on ADA devices!
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.input_scale_initialized or is_compiling():
+            x = self.to_fp8_saturated(x, self.input_scale, self.input_max_value).to(
+                self.input_float8_dtype
+            )
+        else:
+            x = self.quantize_input(x)
+
+        prev_dims = x.shape[:-1]
+        x = x.view(-1, self.in_features)
+
+        if self.weight_sr > 0:
+            rand_sample = torch.randint_like(self.float8_residual, 0, 2**(self.weight_sr)-1) 
+            increment = self.float8_residual > rand_sample
+            del rand_sample
+            eff_float8 = (eff_float8.view(torch.uint8) + increment).view(torch.float8_e4m3fn)
+            del increment
+        else:
+            eff_float8 = self.float8_data.T
+
+        # float8 matmul, much faster than float16 matmul w/ float32 accumulate on ADA devices!
         out = torch._scaled_mm(
             x,
-            self.float8_data.T,
+            eff_float8,
             scale_a=self.input_scale_reciprocal,
             scale_b=self.scale_reciprocal,
             bias=self.bias,
@@ -301,6 +423,9 @@ class F8Linear(nn.Module):
         linear: nn.Linear,
         float8_dtype=torch.float8_e4m3fn,
         input_float8_dtype=torch.float8_e5m2,
+        activation_sr: bool = False,
+        weight_sr: int= 0,
+        new_range: bool = False,
     ) -> "F8Linear":
         f8_lin = cls(
             in_features=linear.in_features,
@@ -312,6 +437,9 @@ class F8Linear(nn.Module):
             float_weight=linear.weight.data,
             float_bias=(linear.bias.data if linear.bias is not None else None),
             input_float8_dtype=input_float8_dtype,
+            activation_sr=activation_sr,
+            weight_sr=weight_sr,
+            new_range=new_range,
         )
         f8_lin.quantize_weight()
         return f8_lin
@@ -324,6 +452,9 @@ def recursive_swap_linears(
     input_float8_dtype=torch.float8_e5m2,
     quantize_modulation: bool = True,
     ignore_keys: list[str] = [],
+    activation_sr: bool = False,
+    weight_sr: int= 0,
+    new_range: bool = False,
 ) -> None:
     """
     Recursively swaps all nn.Linear modules in the given model with F8Linear modules.
@@ -356,6 +487,9 @@ def recursive_swap_linears(
                     child,
                     float8_dtype=float8_dtype,
                     input_float8_dtype=input_float8_dtype,
+                    activation_sr=activation_sr,
+                    weight_sr=weight_sr,
+                    new_range=new_range
                 ),
             )
             del child
@@ -366,6 +500,9 @@ def recursive_swap_linears(
                 input_float8_dtype=input_float8_dtype,
                 quantize_modulation=quantize_modulation,
                 ignore_keys=ignore_keys,
+                activation_sr=activation_sr,
+                weight_sr=weight_sr,
+                new_range=new_range
             )
 
 
@@ -403,6 +540,9 @@ def quantize_flow_transformer_and_dispatch_float8(
     flow_dtype=torch.float16,
     quantize_modulation: bool = True,
     quantize_flow_embedder_layers: bool = True,
+    activation_sr: bool = False,
+    weight_sr: int= 0,
+    new_range: bool = False,
 ) -> nn.Module:
     """
     Quantize the flux flow transformer model (original BFL codebase version) and dispatch to the given device.
@@ -432,6 +572,9 @@ def quantize_flow_transformer_and_dispatch_float8(
             float8_dtype=float8_dtype,
             input_float8_dtype=input_float8_dtype,
             quantize_modulation=quantize_modulation,
+            activation_sr=activation_sr,
+            weight_sr=weight_sr,
+            new_range=new_range
         )
         torch.cuda.empty_cache()
     for module in flow_model.single_blocks:
@@ -442,6 +585,9 @@ def quantize_flow_transformer_and_dispatch_float8(
             float8_dtype=float8_dtype,
             input_float8_dtype=input_float8_dtype,
             quantize_modulation=quantize_modulation,
+            activation_sr=activation_sr,
+            weight_sr=weight_sr,
+            new_range=new_range
         )
         torch.cuda.empty_cache()
     to_gpu_extras = [
@@ -470,6 +616,9 @@ def quantize_flow_transformer_and_dispatch_float8(
                         m_extra,
                         float8_dtype=float8_dtype,
                         input_float8_dtype=input_float8_dtype,
+                        activation_sr=activation_sr,
+                        weight_sr=weight_sr,
+                        new_range=new_range
                     ),
                 )
             del m_extra
@@ -480,6 +629,9 @@ def quantize_flow_transformer_and_dispatch_float8(
                     float8_dtype=float8_dtype,
                     input_float8_dtype=input_float8_dtype,
                     quantize_modulation=quantize_modulation,
+                    activation_sr=activation_sr,
+                    weight_sr=weight_sr,
+                    new_range=new_range
                 )
         torch.cuda.empty_cache()
     if (

@@ -708,6 +708,9 @@ class FluxPipeline:
                     flow_dtype=flux_dtype,
                     quantize_modulation=config.quantize_modulation,
                     quantize_flow_embedder_layers=config.quantize_flow_embedder_layers,
+                    activation_sr = config.activation_sr,
+                    weight_sr = config.weight_sr,
+                    new_range = config.new_range,
                 )
             else:
                 flow_model.eval().requires_grad_(False)
