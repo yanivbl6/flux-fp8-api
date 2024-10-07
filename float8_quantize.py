@@ -397,7 +397,7 @@ class F8Linear(nn.Module):
             rand_sample = torch.randint_like(self.float8_residual, 0, 2**(self.weight_sr)-1) 
             increment = self.float8_residual > rand_sample
             del rand_sample
-            eff_float8 = (eff_float8.view(torch.uint8) + increment).view(torch.float8_e4m3fn)
+            eff_float8 = (self.float8_data.view(torch.uint8) + increment).view(torch.float8_e4m3fn).T
             del increment
         else:
             eff_float8 = self.float8_data.T
