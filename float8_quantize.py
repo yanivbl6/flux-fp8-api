@@ -101,6 +101,14 @@ class F8Linear(nn.Module):
         self.out_features = out_features
         self.float8_dtype = float8_dtype
         self.input_float8_dtype = input_float8_dtype
+
+
+        
+        ## cancel quantization ----------------------------------------
+        self.input_float8_dtype = torch.float16
+        self.float8_dtype = torch.float16
+        # -------------------------------------------------------------
+
         self.input_scale_initialized = False
         self.weight_initialized = False
         self.max_value = torch.finfo(self.float8_dtype).max
@@ -403,15 +411,26 @@ class F8Linear(nn.Module):
             eff_float8 = self.float8_data.T
 
         # float8 matmul, much faster than float16 matmul w/ float32 accumulate on ADA devices!
-        out = torch._scaled_mm(
-            x,
-            eff_float8,
-            scale_a=self.input_scale_reciprocal,
-            scale_b=self.scale_reciprocal,
-            bias=self.bias,
-            out_dtype=self.weight.dtype,
-            use_fast_accum=True,
-        )
+        # float8 matmul, much faster than float16 matmul w/ float32 accumulate on ADA devices!
+        # out = torch._scaled_mm(
+        #     x,
+        #     eff_float8,
+        #     scale_a=self.input_scale_reciprocal,
+        #     scale_b=self.scale_reciprocal,
+        #     bias=self.bias,
+        #     out_dtype=self.weight.dtype,
+        #     use_fast_accum=True,
+        # )
+        # if IS_TORCH_2_4:
+        #     out = out[0]
+        
+        x = self.input_scale_reciprocal * x
+        y = eff_float8 * self.scale_reciprocal
+        out = x @ y
+        
+        if self.bias is not None:
+            out += self.bias
+
         if IS_TORCH_2_4:
             out = out[0]
         out = out.view(*prev_dims, self.out_features)
