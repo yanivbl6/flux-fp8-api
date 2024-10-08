@@ -96,8 +96,8 @@ class F8Linear(nn.Module):
         self.float8_dtype = float8_dtype
         self.input_float8_dtype = input_float8_dtype
 
-##        self.float8_dtype = torch.float8_e4m3fn
-##        self.input_float8_dtype = torch.float8_e4m3fn
+        ##self.float8_dtype = torch.float16
+        ##self.input_float8_dtype = torch.float16
 
         self.pre_dtype = dtype 
         self.input_scale_initialized = False
@@ -386,9 +386,11 @@ class F8Linear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.input_scale_initialized or is_compiling():
-            x = self.to_fp8_saturated(x, self.input_scale, self.input_max_value).to(
-                self.input_float8_dtype
-            )
+
+            if not x.dtype == torch.float16:
+                x = self.to_fp8_saturated(x, self.input_scale, self.input_max_value).to(
+                    self.input_float8_dtype
+                )
         else:
             x = self.quantize_input(x)
 
@@ -398,9 +400,11 @@ class F8Linear(nn.Module):
         # float8 matmul, much faster than float16 matmul w/ float32 accumulate on ADA devices!
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.input_scale_initialized or is_compiling():
-            x = self.to_fp8_saturated(x, self.input_scale, self.input_max_value).to(
-                self.input_float8_dtype
-            )
+
+            if not x.dtype == torch.float16:
+                x = self.to_fp8_saturated(x, self.input_scale, self.input_max_value).to(
+                    self.input_float8_dtype
+                )
         else:
             x = self.quantize_input(x)
 
@@ -417,17 +421,26 @@ class F8Linear(nn.Module):
             eff_float8 = self.float8_data.T
 
         # float8 matmul, much faster than float16 matmul w/ float32 accumulate on ADA devices!
-        out = torch._scaled_mm(
-            x,
-            eff_float8,
-            scale_a=self.input_scale_reciprocal,
-            scale_b=self.scale_reciprocal,
-            bias=self.bias,
-            out_dtype=self.weight.dtype,
-            use_fast_accum=True,
-        )
-        if IS_TORCH_2_4:
-            out = out[0]
+
+
+        if x.dtype == torch.float16:
+            out = x @ eff_float8
+            if self.bias is not None:
+                out += self.bias
+        else: 
+            out = torch._scaled_mm(
+                x,
+                eff_float8,
+                scale_a=self.input_scale_reciprocal,
+                scale_b=self.scale_reciprocal,
+                bias=self.bias,
+                out_dtype=eff_float8.dtype,
+                use_fast_accum=True,
+            )
+            if IS_TORCH_2_4:
+                out = out[0]
+
+
 
         out = out.view(*prev_dims, self.out_features)
         return out
