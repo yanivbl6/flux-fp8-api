@@ -96,6 +96,9 @@ class F8Linear(nn.Module):
         self.float8_dtype = float8_dtype
         self.input_float8_dtype = input_float8_dtype
 
+##        self.float8_dtype = torch.float8_e4m3fn
+##        self.input_float8_dtype = torch.float8_e4m3fn
+
         self.pre_dtype = dtype 
         self.input_scale_initialized = False
         self.weight_initialized = False
