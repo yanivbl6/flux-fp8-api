@@ -49,7 +49,7 @@
   "text_enc_dtype": "bfloat16",
   "text_enc_quantization_dtype": "qfloat8",
   "ae_quantization_dtype": "qfloat8",
-  "activation_sr": false,
+  "activation_sr": true,
   "weight_sr": 0,
   "new_range": false,
   "compile_extras": true,

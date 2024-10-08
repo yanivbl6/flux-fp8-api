@@ -51,7 +51,7 @@
   "ae_quantization_dtype": "qfloat8",
   "activation_sr": false,
   "weight_sr": 0,
-  "new_range": false,
+  "new_range": true,
   "compile_extras": true,
   "compile_blocks": true,
   "offload_ae": false,

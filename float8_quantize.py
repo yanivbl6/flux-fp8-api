@@ -51,15 +51,23 @@ def float16_to_float8_e4m3fn(x, p):
 
     exponent_bits = exponent_bits - 15 + 7  # Adjust exponent bias from 15 (float16) to 7 (float8)
 
-    if exponent_bits < 0:        
-        print("underflow, exponent_bits = %d" % exponent_bits)
-        mantissa_bits = (mantissa_bits + mantissa_add) >> (1 - exponent_bits)
-        exponent_bits = 0
-    elif exponent_bits > 15:
-        print("overflow, exponent_bits = %d" % exponent_bits)
-        exponent_bits = 15
-        mantissa_bits = (mantissa_mask >> 8) << 8
+
+    # if exponent_bits < 0:        
+    #     print("underflow, exponent_bits = %d" % exponent_bits)
+    #     mantissa_bits = (mantissa_bits + mantissa_add) >> (1 - exponent_bits)
+    #     exponent_bits = 0
+    # elif exponent_bits > 15:
+    #     print("overflow, exponent_bits = %d" % exponent_bits)
+    #     exponent_bits = 15
+    #     mantissa_bits = (mantissa_mask >> 8) << 8
     
+
+    mantissa_bits = torch.where(exponent_bits < 0, (mantissa_bits + mantissa_add) >> (1 - exponent_bits), mantissa_bits)
+    mantissa_bits[exponent_bits > 15] = (mantissa_mask >> 8) << 8
+    exponent_bits = exponent_bits.clamp(0, 15)
+
+
+
     # Quantize the mantissa to 3 bits (float8_e4m3fn)
     mantissa_bits = mantissa_bits >> 7  # Keep the top 3 bits of the mantissa
 
@@ -102,13 +110,10 @@ class F8Linear(nn.Module):
         self.float8_dtype = float8_dtype
         self.input_float8_dtype = input_float8_dtype
 
+        # self.float8_dtype = torch.float16
+        # self.input_float8_dtype = torch.float16
 
-        
-        ## cancel quantization ----------------------------------------
-        self.input_float8_dtype = torch.float16
-        self.float8_dtype = torch.float16
-        # -------------------------------------------------------------
-
+        self.pre_dtype = dtype 
         self.input_scale_initialized = False
         self.weight_initialized = False
         self.max_value = torch.finfo(self.float8_dtype).max
@@ -271,6 +276,16 @@ class F8Linear(nn.Module):
     def quantize_weight(self):
         if self.weight_initialized:
             return
+        
+        if  self.float8_dtype == torch.float16:
+            self.scale_reciprocal = torch.tensor(1.0, dtype=torch.float16, device=self.weight.device)
+            self.float8_data = self.weight.data
+            self.weight.data = torch.zeros(
+                1, dtype=self.weight.dtype, device=self.weight.device, requires_grad=False
+            )
+            self.weight_initialized = True
+            return
+        
         amax = torch.max(torch.abs(self.weight.data)).float()
         self.scale = self.amax_to_scale(amax, self.max_value) / self.max_fl
 
@@ -307,6 +322,11 @@ class F8Linear(nn.Module):
         return (x * scale).clamp(-max_val, max_val)
 
     def quantize_input(self, x: torch.Tensor):
+
+        if self.input_float8_dtype == torch.float16:
+            self.input_scale_reciprocal = torch.tensor(1.0, dtype=torch.float16, device=self.weight.device)
+            return x
+
         if self.input_scale_initialized:
             return self.to_fp8_saturated(x, self.input_scale, self.input_max_value).to(
                 self.input_float8_dtype
@@ -327,7 +347,7 @@ class F8Linear(nn.Module):
 
             if self.activation_sr:
                 tmp = self.to_fp8_saturated(x, self.input_scale, self.input_max_value)
-                tmp = tmp.view(torch.uint16) + torch.randint_like(tmp, 0, 2**(10-4)-1)
+                tmp = (tmp.view(torch.int16) + torch.randint_like(tmp, 0, 2**(10-4), dtype = torch.int16)).view(self.pre_dtype)
                 return tmp.to(self.input_float8_dtype)
             else:
                 return self.to_fp8_saturated(x, self.input_scale, self.input_max_value).to(
@@ -341,7 +361,7 @@ class F8Linear(nn.Module):
             self.input_scale_initialized = True
             if self.activation_sr:
                 tmp = self.to_fp8_saturated(x, self.input_scale, self.input_max_value)
-                tmp = tmp.view(torch.uint16) + torch.randint_like(tmp, 0, 2**(10-4)-1)
+                tmp = (tmp.view(torch.int16) + torch.randint_like(tmp, 0, 2**(10-4), dtype = torch.int16)).view(self.pre_dtype)
                 return tmp.to(self.input_float8_dtype)
             else:
                 return self.to_fp8_saturated(x, self.input_scale, self.input_max_value).to(
@@ -372,7 +392,7 @@ class F8Linear(nn.Module):
         self.max_value = torch.finfo(self.float8_dtype).max
         self.input_max_value = torch.finfo(self.input_float8_dtype).max
 
-        if new_range:
+        if self.new_range:
             self.max_fl = 2**(math.floor(math.log2(self.max_value)))
         else:
             self.max_fl = 1
@@ -402,7 +422,7 @@ class F8Linear(nn.Module):
         x = x.view(-1, self.in_features)
 
         if self.weight_sr > 0:
-            rand_sample = torch.randint_like(self.float8_residual, 0, 2**(self.weight_sr)-1) 
+            rand_sample = torch.randint_like(self.float8_residual, 0, 2**(self.weight_sr)) 
             increment = self.float8_residual > rand_sample
             del rand_sample
             eff_float8 = (self.float8_data.view(torch.uint8) + increment).view(torch.float8_e4m3fn).T
@@ -410,7 +430,6 @@ class F8Linear(nn.Module):
         else:
             eff_float8 = self.float8_data.T
 
-        # float8 matmul, much faster than float16 matmul w/ float32 accumulate on ADA devices!
         # float8 matmul, much faster than float16 matmul w/ float32 accumulate on ADA devices!
         # out = torch._scaled_mm(
         #     x,
@@ -424,6 +443,10 @@ class F8Linear(nn.Module):
         # if IS_TORCH_2_4:
         #     out = out[0]
         
+
+        x = x.to(torch.float16)
+        eff_float8 = eff_float8.to(torch.float16)
+
         x = self.input_scale_reciprocal * x
         y = eff_float8 * self.scale_reciprocal
         out = x @ y
@@ -431,8 +454,6 @@ class F8Linear(nn.Module):
         if self.bias is not None:
             out += self.bias
 
-        if IS_TORCH_2_4:
-            out = out[0]
         out = out.view(*prev_dims, self.out_features)
         return out
 
